@@ -37,6 +37,18 @@ module JutulDarcy
     export ReservoirSimResult
     export reservoir_domain
     export reservoir_model
+    export tpfa_stencil_quantities
+    export tpfa_laplacian
+    export MaternSPDE2Prior
+    export MaternSPDE3Prior
+    export MaternHaloSpec
+    export matern_parameter_fields
+    export matern_spde_operator
+    export matern_sd_compensation!
+    export matern_range_compensation!
+    export matern_realized_variance
+    export matern_realized_ranges
+    export matern_realized_axis_ranges
     export setup_reservoir_model
     export setup_reservoir_simulator
     export simulate_reservoir
@@ -156,6 +168,8 @@ module JutulDarcy
     include("deck_types.jl")
     include("porousmedia_grids.jl")
     include("utils.jl")
+    include("matern_spde.jl")
+    include("matern_spde_3d.jl")
     include("state0.jl")
     include("interpolation.jl")
     # Definitions for multiphase flow

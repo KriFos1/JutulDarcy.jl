@@ -2235,6 +2235,88 @@ function reservoir_transmissibility(d::DataDomain; version = :xyz)
     return T
 end
 
+"""
+    tpfa_stencil_quantities(domain; laplace_from = :geometry, version = :xyz)
+
+Return quantities needed to assemble a finite-volume TPFA Laplacian:
+- `neighbors::Matrix{Int}`: `2 x nf` face-to-cell connectivity
+- `transmissibilities::Vector`: one TPFA weight per face
+- `volumes::Vector`: one cell volume per cell, suitable for lumped mass matrices
+
+The `laplace_from` keyword controls the face weights:
+- `:geometry`: unit permeability, giving a geometric TPFA Laplacian
+- `:flow`: domain permeability, giving the Darcy-flow TPFA operator
+- `:unit`: unit face weights, giving a graph Laplacian
+
+Boundary conditions are not included in the returned stencil. The assembled
+operator therefore corresponds to homogeneous Neumann/no-flux boundaries unless
+additional boundary terms are added separately.
+
+For grids that are not TPFA-compatible, the resulting operator is only an
+approximation to the continuous Laplace operator.
+"""
+function tpfa_stencil_quantities(domain::DataDomain; laplace_from::Symbol = :geometry, version = :xyz)
+    N = domain[:neighbors]
+    V = domain[:volumes]
+
+    T = if laplace_from === :flow
+        reservoir_transmissibility(domain; version = version)
+    elseif laplace_from === :geometry
+        d2 = deepcopy(domain)
+        perm = domain[:permeability]
+        d2[:permeability] = ones(eltype(perm), size(perm))
+        reservoir_transmissibility(d2; version = version)
+    elseif laplace_from === :unit
+        ones(eltype(V), size(N, 2))
+    else
+        throw(ArgumentError("laplace_from must be one of :geometry, :flow, :unit (got $laplace_from)"))
+    end
+
+    return (neighbors = N, transmissibilities = T, volumes = V)
+end
+
+"""
+    tpfa_laplacian(neighbors, transmissibilities, nc)
+
+Assemble a symmetric finite-volume TPFA Laplacian with off-diagonal couplings
+`-T_f` and diagonal row sums. Faces with non-positive neighbor indices are
+ignored, which makes the resulting operator homogeneous Neumann/no-flux unless
+boundary contributions are added separately.
+"""
+function tpfa_laplacian(neighbors::AbstractMatrix{<:Integer}, transmissibilities::AbstractVector, nc::Integer)
+    size(neighbors, 1) == 2 || throw(ArgumentError("neighbors must have size (2, nf), got $(size(neighbors))"))
+    nf = size(neighbors, 2)
+    length(transmissibilities) == nf || throw(ArgumentError("transmissibilities must have length $nf, got $(length(transmissibilities))"))
+
+    Tv = eltype(transmissibilities)
+    diag = zeros(Tv, nc)
+
+    I = Int[]
+    J = Int[]
+    V = Tv[]
+    sizehint!(I, 2 * nf + nc)
+    sizehint!(J, 2 * nf + nc)
+    sizehint!(V, 2 * nf + nc)
+
+    @inbounds for f in 1:nf
+        i = neighbors[1, f]
+        j = neighbors[2, f]
+        w = transmissibilities[f]
+        if i > 0 && j > 0
+            push!(I, i); push!(J, j); push!(V, -w)
+            push!(I, j); push!(J, i); push!(V, -w)
+            diag[i] += w
+            diag[j] += w
+        end
+    end
+
+    @inbounds for i in 1:nc
+        push!(I, i); push!(J, i); push!(V, diag[i])
+    end
+
+    return sparse(I, J, V, nc, nc)
+end
+
 function set_aquifer_transmissibilities!(T, mesh, perm, ntg, aquifers, cell_centroids, bnd_centroids, bnd_neighbors, bnd_areas)
     num_aquifer_faces = 0
     # Connections to the reservoir
