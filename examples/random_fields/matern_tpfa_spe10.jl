@@ -557,8 +557,8 @@ end
 
 function build_prior_spec(domain; mode = :stationary)
     nc = number_of_cells(domain)
-    ρ0 = 1500.0 * si_unit(:meter)
-    σ0 = 1.0
+    ρ0 = 25.0 * si_unit(:meter)
+    σ0 = sqrt(3.0)
     Bx = normalized_basis_from_coord(domain, 1)
     By = normalized_basis_from_coord(domain, 2)
     Bc = ones(nc, 1)

@@ -1,4 +1,4 @@
-mutable struct MaternSPDE3Prior{T<:AbstractFloat}
+mutable struct MaternSPDE3Prior{T<:AbstractFloat, M<:AbstractMatrix{T}}
     nc::Int
     ν::T
     ρ0::T
@@ -6,6 +6,8 @@ mutable struct MaternSPDE3Prior{T<:AbstractFloat}
     κ_min::T
     laplace_from::Symbol
     version::Symbol
+    anisotropy_a_basis::M
+    anisotropy_b_basis::M
     sd_compensation::Any
 end
 
@@ -16,11 +18,17 @@ struct MaternMeanSDCompensation{T<:AbstractFloat}
 end
 
 """
-    MaternSPDE3Prior(nc; ν = 0.5, ρ0 = 1.0, σ0 = 1.0, κ_min = 1e-8, laplace_from = :geometry, version = :xyz)
+    MaternSPDE3Prior(nc; ν = 0.5, ρ0 = 1.0, σ0 = 1.0, κ_min = 1e-8, laplace_from = :geometry, version = :xyz, anisotropy_a_basis = nothing, anisotropy_b_basis = nothing)
 
-Specification for a stationary isotropic 3D Matérn SPDE prior with `α = 2`.
-This first implementation targets true volumetric fields on the full active
-corner-point grid and supports only mean marginal-variance compensation.
+Specification for a 3D Matérn SPDE prior with `α = 2` and optional
+axis-aligned anisotropy.
+
+The anisotropy is parameterised by two scalars `a`, `b` that define a
+diagonal diffusion tensor `H = diag(exp(a), exp(b), exp(-(a+b)))` with
+`det(H) = 1`.  When `a = b = 0` the model is isotropic.  The effective
+correlation ranges become `ρ_I = ρ₀ exp(a/2)`, `ρ_J = ρ₀ exp(b/2)`,
+`ρ_K = ρ₀ exp(-(a+b)/2)`.  Spatially varying anisotropy is supported
+through `anisotropy_a_basis` and `anisotropy_b_basis` matrices.
 """
 function MaternSPDE3Prior(
         nc::Integer;
@@ -29,7 +37,9 @@ function MaternSPDE3Prior(
         σ0::Real = 1.0,
         κ_min::Real = 1e-8,
         laplace_from::Symbol = :geometry,
-        version::Symbol = :xyz
+        version::Symbol = :xyz,
+        anisotropy_a_basis = nothing,
+        anisotropy_b_basis = nothing
     )
     T = Float64
     νf = T(ν)
@@ -42,23 +52,57 @@ function MaternSPDE3Prior(
     κminf > 0 || throw(ArgumentError("κ_min must be positive, got $κ_min."))
     laplace_from in (:geometry, :flow, :unit) || throw(ArgumentError("laplace_from must be one of :geometry, :flow, :unit (got $laplace_from)."))
     version == :xyz || throw(ArgumentError("The 3D Matérn SPDE implementation currently only supports version = :xyz (got $version)."))
-    return MaternSPDE3Prior(Int(nc), νf, ρ0f, σ0f, κminf, laplace_from, version, nothing)
+    Ba = _matern_basis_matrix(anisotropy_a_basis, nc, T)
+    Bb = _matern_basis_matrix(anisotropy_b_basis, nc, T)
+    return MaternSPDE3Prior(Int(nc), νf, ρ0f, σ0f, κminf, laplace_from, version, Ba, Bb, nothing)
+end
+
+function _normalize_matern_theta_3d(prior::MaternSPDE3Prior, θ)
+    θ isa NamedTuple || throw(ArgumentError("θ must be a named tuple with optional fields :anisotropy_a, :anisotropy_b."))
+    return (
+        anisotropy_a = _theta_block(θ, :anisotropy_a, size(prior.anisotropy_a_basis, 2)),
+        anisotropy_b = _theta_block(θ, :anisotropy_b, size(prior.anisotropy_b_basis, 2))
+    )
 end
 
 function matern_parameter_fields(prior::MaternSPDE3Prior, θ = NamedTuple())
-    θ isa NamedTuple || throw(ArgumentError("θ must be a named tuple. The 3D implementation is stationary and isotropic only, so θ must be empty."))
-    isempty(keys(θ)) || throw(ArgumentError("The first 3D implementation is stationary and isotropic only; θ must be empty."))
+    θn = _normalize_matern_theta_3d(prior, θ)
     ρ = fill(prior.ρ0, prior.nc)
     σ = fill(prior.σ0, prior.nc)
     κ = fill(max(sqrt(8*prior.ν)/prior.ρ0, prior.κ_min), prior.nc)
     τ_nominal = _matern_tau_nominal(prior.ν, κ, σ; d = 3.0)
+
+    a = prior.anisotropy_a_basis * θn.anisotropy_a
+    b = prior.anisotropy_b_basis * θn.anisotropy_b
+    H = _matern_diagonal_anisotropy_3d(a, b)
     return (
-        θ = NamedTuple(),
+        θ = θn,
         ρ = ρ,
         σ = σ,
         κ = κ,
-        τ_nominal = τ_nominal
+        τ_nominal = τ_nominal,
+        a = a,
+        b = b,
+        H = H
     )
+end
+
+"""
+    _matern_diagonal_anisotropy_3d(a, b)
+
+Build diagonal diffusion tensor `H = diag(exp(a), exp(b), exp(-(a+b)))`
+with `det(H) = 1`, stored as a `3 × n` matrix.
+"""
+function _matern_diagonal_anisotropy_3d(a::AbstractVector, b::AbstractVector)
+    n = length(a)
+    length(b) == n || throw(ArgumentError("a and b must have equal length."))
+    H = Matrix{Float64}(undef, 3, n)
+    @inbounds for i in 1:n
+        H[1, i] = exp(a[i])
+        H[2, i] = exp(b[i])
+        H[3, i] = exp(-(a[i] + b[i]))
+    end
+    return H
 end
 
 function matern_realized_ranges(domain::DataDomain, prior::MaternSPDE3Prior, θ = NamedTuple(); kwargs...)
@@ -106,19 +150,43 @@ end
 function _matern_diffusion_transmissibility(domain::DataDomain, prior::MaternSPDE3Prior, fields)
     if prior.laplace_from == :geometry
         d2 = deepcopy(domain)
-        d2[:permeability] = ones(Float64, 3, number_of_cells(d2))
+        d2[:permeability] = _embed_diagonal_tensor_3d(fields.H)
         _neutralize_matern_flow_controls!(d2)
-        return reservoir_transmissibility(d2; version = prior.version)
+        T = reservoir_transmissibility(d2; version = prior.version)
     elseif prior.laplace_from == :flow
-        return reservoir_transmissibility(domain; version = prior.version)
+        T = reservoir_transmissibility(domain; version = prior.version)
     elseif prior.laplace_from == :unit
-        return ones(Float64, size(domain[:neighbors], 2))
+        T = ones(Float64, size(domain[:neighbors], 2))
     else
         error("Unsupported laplace_from = $(prior.laplace_from)")
     end
+
+    bad = 0
+    for i in eachindex(T)
+        if !isfinite(T[i])
+            T[i] = 0.0
+            bad += 1
+        end
+    end
+    if bad > 0
+        jutul_message("Matérn SPDE", "Replaced $bad non-finite face transmissibilities with zero during 3D operator assembly.")
+    end
+    return T
+end
+
+"""
+    _embed_diagonal_tensor_3d(H::AbstractMatrix)
+
+Convert a `3 × nc` diagonal tensor to the 3-row permeability format expected
+by `reservoir_transmissibility`.
+"""
+function _embed_diagonal_tensor_3d(H::AbstractMatrix)
+    size(H, 1) == 3 || throw(ArgumentError("H must have 3 rows, got $(size(H, 1))."))
+    return copy(H)
 end
 
 function _matern_extend_fields_3d(fields, source::AbstractVector{<:Integer}, κ_eff::AbstractVector, τ_eff::AbstractVector, logtau_offset::Real)
+    H_ext = isempty(source) ? fields.H : hcat(fields.H, fields.H[:, source])
     return (
         θ = fields.θ,
         ρ = vcat(fields.ρ, fields.ρ[source]),
@@ -127,7 +195,10 @@ function _matern_extend_fields_3d(fields, source::AbstractVector{<:Integer}, κ_
         τ_nominal = vcat(fields.τ_nominal, fields.τ_nominal[source]),
         κ_eff = vcat(κ_eff, κ_eff[source]),
         τ = vcat(τ_eff, τ_eff[source]),
-        logtau_offset = fill(Float64(logtau_offset), length(κ_eff) + length(source))
+        logtau_offset = fill(Float64(logtau_offset), length(κ_eff) + length(source)),
+        a = vcat(fields.a, isempty(source) ? Float64[] : fields.a[source]),
+        b = vcat(fields.b, isempty(source) ? Float64[] : fields.b[source]),
+        H = H_ext
     )
 end
 
@@ -209,6 +280,78 @@ function matern_spde_operator(domain::DataDomain, prior::MaternSPDE3Prior, θ = 
     )
 end
 
+"""
+    _qinv_diagonal_via_K(K, C, τ, idx; chunk_size = 32)
+
+Compute `diag(Q⁻¹)` at `idx` via the K factorization instead of factorizing Q
+directly.  Since `Q = Dτ K C⁻¹ K Dτ`, we have
+`Q⁻¹[j,j] = ‖√C · K⁻¹(eⱼ/τⱼ)‖²`, requiring only one K solve per cell.
+
+This avoids forming Q explicitly, which can lose positive-definiteness when the
+diagonal spans many orders of magnitude.
+"""
+function _qinv_diagonal_via_K(K::Symmetric, C::Diagonal, τ::AbstractVector, idx::AbstractVector{<:Integer}; chunk_size::Int = 32)
+    FK = cholesky(K)
+    n = size(K, 1)
+    Vvec = C.diag
+    vals = zeros(Float64, length(idx))
+    for start in 1:chunk_size:length(idx)
+        stop = min(start + chunk_size - 1, length(idx))
+        block = idx[start:stop]
+        E = zeros(Float64, n, length(block))
+        for (k, j) in enumerate(block)
+            E[j, k] = 1.0 / τ[j]
+        end
+        U = FK \ E   # U[:,k] = K⁻¹ (e_j / τ_j)
+        for (k, _) in enumerate(block)
+            s = 0.0
+            @inbounds for i in 1:n
+                s += Vvec[i] * U[i, k]^2
+            end
+            vals[start + k - 1] = s
+        end
+    end
+    return vals
+end
+
+"""
+    _qinv_columns_via_K(K, C, τ, idx; chunk_size = 16)
+
+Compute full columns `Q⁻¹[:, j]` for each `j` in `idx` through K.
+Requires two K solves per column: `Q⁻¹ eⱼ = Dτ⁻¹ K⁻¹ C K⁻¹ (eⱼ/τⱼ)`.
+"""
+function _qinv_columns_via_K(K::Symmetric, C::Diagonal, τ::AbstractVector, idx::AbstractVector{<:Integer}; chunk_size::Int = 16)
+    FK = cholesky(K)
+    n = size(K, 1)
+    Vvec = C.diag
+    cols = Matrix{Float64}(undef, n, length(idx))
+    for start in 1:chunk_size:length(idx)
+        stop = min(start + chunk_size - 1, length(idx))
+        block = idx[start:stop]
+        # First solve: u = K⁻¹ (e_j / τ_j)
+        E = zeros(Float64, n, length(block))
+        for (k, j) in enumerate(block)
+            E[j, k] = 1.0 / τ[j]
+        end
+        U = FK \ E
+        # Multiply by C: h = V .* u
+        for (k, _) in enumerate(block)
+            @inbounds for i in 1:n
+                U[i, k] *= Vvec[i]
+            end
+        end
+        # Second solve: p = K⁻¹ h, then divide by τ
+        P = FK \ U
+        for (k, _) in enumerate(block)
+            @inbounds for i in 1:n
+                P[i, k] /= τ[i]
+            end
+        end
+        cols[:, start:stop] .= P
+    end
+    return cols
+end
+
 function matern_realized_variance(
         domain::DataDomain,
         prior::MaternSPDE3Prior,
@@ -221,19 +364,23 @@ function matern_realized_variance(
     method == :diag_qinv || throw(ArgumentError("Only method = :diag_qinv is supported, got $method."))
     op = matern_spde_operator(domain, prior, θ; compensated = compensated, halo = halo)
     idx = _resolve_matern_anchors(prior.nc, anchors)
-    diagvals = _selected_qinv_diagonal(op.Q, idx)
+    diagvals = _qinv_diagonal_via_K(op.K, op.C, op.fields.τ, idx)
     return (anchors = idx, realized = diagvals, target = op.fields.σ[idx].^2)
 end
 
 """
-    matern_sd_compensation!(prior::MaternSPDE3Prior, domain; mode = :mean, diag_method = :chol, anchors = :all, fd_delta = 1e-3, halo = nothing)
+    matern_sd_compensation!(prior::MaternSPDE3Prior, domain, θ = NamedTuple(); mode = :mean, diag_method = :chol, anchors = :all, fd_delta = 1e-3, halo = nothing)
 
 Calibrate a cached scalar additive correction to `log(τ)` from mesh-based
 realized variance. Only mean compensation is supported in 3D v1.
+
+When using anisotropy, pass the same `θ` that will be used to build the
+operator so that compensation is calibrated for the correct Laplacian.
 """
 function matern_sd_compensation!(
         prior::MaternSPDE3Prior,
-        domain::DataDomain;
+        domain::DataDomain,
+        θ = NamedTuple();
         mode::Symbol = :mean,
         diag_method::Symbol = :chol,
         anchors = :all,
@@ -250,9 +397,8 @@ function matern_sd_compensation!(
 
     saved = prior.sd_compensation
     prior.sd_compensation = nothing
-    θ0 = NamedTuple()
-    base = matern_realized_variance(domain, prior, θ0; anchors = idx, compensated = true, halo = halo)
-    target = matern_parameter_fields(prior, θ0).σ[idx].^2
+    base = matern_realized_variance(domain, prior, θ; anchors = idx, compensated = true, halo = halo)
+    target = matern_parameter_fields(prior, θ).σ[idx].^2
     offset = mean(0.5 .* (log.(base.realized) .- log.(target)))
     prior.sd_compensation = MaternMeanSDCompensation(:mean, idx, Float64(offset))
     return prior
@@ -276,12 +422,12 @@ function matern_realized_axis_ranges(
     op = matern_spde_operator(domain, prior, θ; compensated = compensated, halo = halo)
     idx = _resolve_matern_anchors(prior.nc, anchors)
     if prior.nc <= 256
-        vars = _selected_qinv_diagonal(op.Q, collect(1:prior.nc))
+        vars = _qinv_diagonal_via_K(op.K, op.C, op.fields.τ, collect(1:prior.nc))
     else
         vars = copy(op.fields.σ[1:prior.nc].^2)
-        vars[idx] .= _selected_qinv_diagonal(op.Q, idx)
+        vars[idx] .= _qinv_diagonal_via_K(op.K, op.C, op.fields.τ, idx)
     end
-    covcols = _selected_qinv_columns(op.Q, idx)[1:prior.nc, :]
+    covcols = _qinv_columns_via_K(op.K, op.C, op.fields.τ, idx)[1:prior.nc, :]
     pts = Matrix{Float64}(domain[:cell_centroids])
 
     rx = Vector{Float64}(undef, length(idx))
@@ -304,9 +450,9 @@ function matern_realized_axis_ranges(
         realized_x = rx,
         realized_y = ry,
         realized_z = rz,
-        target_x = op.fields.ρ[idx],
-        target_y = op.fields.ρ[idx],
-        target_z = op.fields.ρ[idx]
+        target_x = op.fields.ρ[idx] .* exp.(0.5 .* op.fields.a[idx]),
+        target_y = op.fields.ρ[idx] .* exp.(0.5 .* op.fields.b[idx]),
+        target_z = op.fields.ρ[idx] .* exp.(-0.5 .* (op.fields.a[idx] .+ op.fields.b[idx]))
     )
 end
 
@@ -314,7 +460,7 @@ function _boundary_face_nodes_3d(domain::DataDomain)
     g = physical_representation(domain)
     faces_to_nodes = g.boundary_faces.faces_to_nodes
     pos = faces_to_nodes.pos
-    vals = faces_to_nodes.val
+    vals = faces_to_nodes.vals
     nf = length(g.boundary_faces.neighbors)
     out = Vector{Vector{Int}}(undef, nf)
     for f in 1:nf
@@ -376,12 +522,23 @@ function _build_matern_halo_3d(domain::DataDomain, halo::MaternHaloSpec, fields,
     normals = Matrix{Float64}(domain[:boundary_normals])
     nb = length(bn)
 
-    boundary_cells = unique(bn)
+    # Skip boundary faces with non-finite centroids or normals (degenerate geometry)
+    valid_bnd = Int[]
+    for f in 1:nb
+        if all(isfinite, bc[:, f]) && all(isfinite, normals[:, f])
+            push!(valid_bnd, f)
+        end
+    end
+    nb_valid = length(valid_bnd)
+    if nb_valid < nb
+        jutul_message("Matérn SPDE", "Skipped $(nb - nb_valid) boundary faces with non-finite centroids/normals during 3D halo construction.")
+    end
+
+    boundary_cells = unique(bn[valid_bnd])
     total_padding = _halo_total_padding(halo.total_padding, fields.ρ[boundary_cells])
     widths = _halo_layer_widths(total_padding, halo.layers, halo.growth)
 
-    nh = nb * halo.layers
-    halo_idx = collect((nc + 1):(nc + nh))
+    nh = nb_valid * halo.layers
     halo_centroids = zeros(Float64, 3, nh)
     halo_volumes = zeros(Float64, nh)
     halo_source = zeros(Int, nh)
@@ -405,7 +562,7 @@ function _build_matern_halo_3d(domain::DataDomain, halo::MaternHaloSpec, fields,
     end
 
     cursor = 0
-    for f in 1:nb
+    for f in valid_bnd
         cell = bn[f]
         out = bc[:, f] .- cc[:, cell]
         if norm(out) <= 1e-10
@@ -445,9 +602,11 @@ function _build_matern_halo_3d(domain::DataDomain, halo::MaternHaloSpec, fields,
         face_normal_weights[f] = normal_weights
     end
 
+    halo_idx = collect((nc + 1):(nc + nh))
     adjacency = _boundary_surface_adjacency_3d(domain; include_corners = halo.include_corners)
     for (f1, f2, shared_len) in adjacency
         shared_len > 0 || continue
+        haskey(face_to_chain, f1) && haskey(face_to_chain, f2) || continue
         chain1 = face_to_chain[f1]
         chain2 = face_to_chain[f2]
         base_dist = max(norm(bc[:, f1] .- bc[:, f2]), 1e-8)

@@ -1009,8 +1009,27 @@ function _anchor_sensitivity_to_cells(domain::DataDomain, anchors::AbstractVecto
     return S
 end
 
+function _factor_precision_matrix(Q::Symmetric; shift_rtol::Real = 1e-12, max_tries::Integer = 10)
+    try
+        return cholesky(Q)
+    catch err
+        err isa PosDefException || rethrow()
+    end
+
+    diag_scale = max(maximum(abs, diag(parent(Q))), 1.0)
+    for k in 0:(max_tries - 1)
+        shift = Float64(shift_rtol) * diag_scale * 10.0^k
+        try
+            return cholesky(Q; shift = shift, check = true)
+        catch err
+            err isa PosDefException || rethrow()
+        end
+    end
+    throw(PosDefException(size(Q, 1)))
+end
+
 function _selected_qinv_diagonal(Q::Symmetric, idx::AbstractVector{<:Integer}; chunk_size::Int = 32)
-    F = cholesky(Q)
+    F = _factor_precision_matrix(Q)
     n = size(Q, 1)
     vals = zeros(Float64, length(idx))
     e = zeros(Float64, n, 0)
@@ -1030,7 +1049,7 @@ function _selected_qinv_diagonal(Q::Symmetric, idx::AbstractVector{<:Integer}; c
 end
 
 function _selected_qinv_columns(Q::Symmetric, idx::AbstractVector{<:Integer}; chunk_size::Int = 16)
-    F = cholesky(Q)
+    F = _factor_precision_matrix(Q)
     n = size(Q, 1)
     cols = Matrix{Float64}(undef, n, length(idx))
     for start in 1:chunk_size:length(idx)
