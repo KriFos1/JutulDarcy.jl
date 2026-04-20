@@ -1,7 +1,7 @@
 name = "JutulDarcy"
 uuid = "82210473-ab04-4dce-b31b-11573c4f8e0a"
-authors = ["Olav Møyner <olav.moyner@gmail.com>"]
 version = "0.3.5"
+authors = ["Olav Møyner <olav.moyner@gmail.com>"]
 
 [deps]
 AlgebraicMultigrid = "2169fc97-5a83-5252-b627-83903c6c433c"
@@ -13,6 +13,7 @@ DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
 DocStringExtensions = "ffbed154-4ef7-542d-bbb7-c09d3a79fcae"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 GeoEnergyIO = "3b1dd628-313a-45bb-9d8d-8f3c48dcb5d4"
+IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
 Jutul = "2b460a1a-8a2b-45b2-b125-b5c536396eb9"
 Krylov = "ba0b0d4f-ebba-5204-a429-3ac8c609bfb7"
 LazyArtifacts = "4af54fe1-eca0-43a8-85a7-787d91b784e3"
@@ -63,6 +64,7 @@ DocStringExtensions = "0.9.3"
 ForwardDiff = "0.10.30"
 GeoEnergyIO = "1.1.29"
 HYPRE = "1.6.0, 1.7"
+IJulia = "1.34.4"
 Jutul = "0.4.18"
 Krylov = "0.9.1"
 LazyArtifacts = "1"

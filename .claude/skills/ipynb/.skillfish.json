@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "ipynb",
+  "owner": "ali",
+  "repo": "claude-colab",
+  "path": "src/plugin/skills/ipynb",
+  "branch": "main",
+  "sha": "2508963f5908972f166f980087165f214da61331",
+  "source": "manual"
+}
