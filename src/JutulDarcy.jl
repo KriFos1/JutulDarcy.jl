@@ -159,7 +159,7 @@ module JutulDarcy
     # PVT
     using MultiComponentFlash
     using MAT
-    using LoopVectorization, Polyester
+    using Polyester
     using TimerOutputs
     using PrecompileTools
     using Dates
