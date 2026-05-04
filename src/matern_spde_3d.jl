@@ -405,16 +405,18 @@ function matern_sd_compensation!(
 end
 
 """
-    matern_realized_axis_ranges(domain, prior::MaternSPDE3Prior, θ = NamedTuple(); anchors = :all, corr_level = 0.1, compensated = true, halo = nothing)
+    matern_realized_axis_ranges(domain, prior::MaternSPDE3Prior, θ = NamedTuple(); anchors = :all, corr_level = practical_range, compensated = true, halo = nothing)
 
 Estimate realized practical ranges along the global x-, y-, and z-axes.
+By default, `corr_level` is the correlation implied by the `sqrt(8ν)/ρ`
+practical range convention.
 """
 function matern_realized_axis_ranges(
         domain::DataDomain,
         prior::MaternSPDE3Prior,
         θ = NamedTuple();
         anchors = :all,
-        corr_level::Real = 0.1,
+        corr_level::Real = _matern_practical_corr_level(prior.ν),
         compensated::Bool = true,
         halo = nothing
     )
@@ -458,10 +460,11 @@ end
 
 function _boundary_face_nodes_3d(domain::DataDomain)
     g = physical_representation(domain)
-    faces_to_nodes = g.boundary_faces.faces_to_nodes
+    gu = g isa UnstructuredMesh ? g : UnstructuredMesh(g)
+    faces_to_nodes = gu.boundary_faces.faces_to_nodes
     pos = faces_to_nodes.pos
     vals = faces_to_nodes.vals
-    nf = length(g.boundary_faces.neighbors)
+    nf = length(gu.boundary_faces.neighbors)
     out = Vector{Vector{Int}}(undef, nf)
     for f in 1:nf
         out[f] = Int.(vals[pos[f]:(pos[f + 1] - 1)])
@@ -472,7 +475,8 @@ end
 function _boundary_surface_adjacency_3d(domain::DataDomain; include_corners::Bool = true)
     g = physical_representation(domain)
     nodes = _boundary_face_nodes_3d(domain)
-    pts = g.node_points
+    gu = g isa UnstructuredMesh ? g : UnstructuredMesh(g)
+    pts = gu.node_points
     normals = Matrix{Float64}(domain[:boundary_normals])
     edge_to_faces = Dict{Tuple{Int, Int}, Vector{Int}}()
     edge_length = Dict{Tuple{Int, Int}, Float64}()

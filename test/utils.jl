@@ -1,4 +1,4 @@
-using Jutul, JutulDarcy, Test, LinearAlgebra, Statistics
+using Jutul, JutulDarcy, Test, LinearAlgebra, SparseArrays, Statistics
 
 function nearest_cell_2d(domain, xref, yref)
     cc = domain[:cell_centroids]
@@ -182,129 +182,293 @@ end
     @test L[r, l] ≈ -7.0
 end
 
-@testset "matern spde stationary operator" begin
+@testset "matern layer extraction and basis helpers" begin
+    g = CartesianMesh((4, 4, 2), (4.0, 4.0, 2.0))
+    d = reservoir_domain(g, permeability = 1.0, porosity = 0.2)
+    layer = extract_reservoir_layer(d; layer = 1)
+
+    @test number_of_cells(layer.domain) == 16
+    @test layer.layer == 1
+    @test layer.parent_shape == (4, 4)
+    @test length(layer.active_parent_linear) == 16
+    @test count(layer.active_mask) == 16
+
+    trend = matern_trend_basis(layer)
+    raster = matern_raster_basis(layer, reshape(1:16, 4, 4))
+    region = matern_region_basis(layer, reshape([i <= 8 ? :west : :east for i in 1:16], 4, 4))
+    identity_basis = matern_identity_basis(layer)
+    combined = combine_matern_basis(trend, raster)
+
+    @test size(trend.matrix) == (16, 2)
+    @test trend.names == [:x, :y]
+    @test size(raster.matrix) == (16, 1)
+    @test raster.names == [:raster]
+    @test size(region.matrix) == (16, 1)
+    @test identity_basis.matrix isa SparseMatrixCSC
+    @test combined.matrix isa Matrix
+    @test combined.names == [:x, :y, :raster]
+
+    range_field = collect(range(12.0, 18.0, length = 16))
+    sd_field = collect(range(0.9, 1.1, length = 16))
+    ratio_field = collect(range(1.05, 1.35, length = 16))
+    angle_field_deg = collect(range(-10.0, 10.0, length = 16))
+    fit = fit_matern_fields(
+        layer,
+        identity_basis;
+        range0 = exp(mean(log.(range_field))),
+        sd0 = exp(mean(log.(sd_field))),
+        angle0 = 0.0,
+        logratio0 = mean(log.(ratio_field)),
+        range = range_field,
+        sd = sd_field,
+        angle = angle_field_deg,
+        ratio = ratio_field,
+        angle_unit = :degree
+    )
+
+    prior = MaternSPDE2Prior(
+        number_of_cells(layer.domain);
+        basis = fit.basis,
+        range0 = fit.baselines.range0,
+        sd0 = fit.baselines.sd0,
+        angle0 = fit.baselines.angle0,
+        logratio0 = fit.baselines.logratio0
+    )
+    fields = matern_parameter_fields(prior, fit.θ)
+
+    @test fields.ρ ≈ range_field rtol = 1e-10
+    @test fields.σ ≈ sd_field rtol = 1e-10
+    @test fields.ratio ≈ ratio_field rtol = 1e-10
+    @test fields.orientation ≈ deg2rad.(angle_field_deg) atol = 1e-10
+end
+
+@testset "matern spde stationary operator and fallback" begin
     g = CartesianMesh((4, 4), (4.0, 4.0))
     d = reservoir_domain(g, permeability = 1.0, porosity = 0.2)
     q = tpfa_stencil_quantities(d, laplace_from = :geometry)
     L = tpfa_laplacian(q.neighbors, q.transmissibilities, number_of_cells(d))
 
-    prior = MaternSPDE2Prior(number_of_cells(d); ρ0 = 2.5, σ0 = 1.2)
+    prior = MaternSPDE2Prior(number_of_cells(d); range0 = 2.5, sd0 = 1.2)
     fields = matern_parameter_fields(prior)
-    op = matern_spde_operator(d, prior; compensated = false)
+
+    @test_throws ArgumentError matern_spde_operator(d, prior; strict = true)
+    op = @test_logs (:warn, r"No MaternCalibration provided") matern_spde_operator(d, prior)
 
     @test Matrix(op.L_H) ≈ Matrix(L)
     @test op.fields.κ_eff ≈ fields.κ
     @test op.fields.τ ≈ fields.τ_nominal
+    @test op.calibration_status == :missing_fallback
     @test issymmetric(Matrix(op.Q))
     @test minimum(eigvals(Symmetric(Matrix(op.Q)))) > 0
 end
 
-@testset "matern spde anisotropy and compensation" begin
-    g = CartesianMesh((5, 5), (5.0, 5.0))
+@testset "matern spde basis-driven anisotropy fields" begin
+    g = CartesianMesh((15, 15, 2), (15.0, 15.0, 2.0))
     d = reservoir_domain(g, permeability = 1.0, porosity = 0.2)
-    nc = number_of_cells(d)
-    cc = d[:cell_centroids]
-
-    Bx = normalized_basis_from_coord(d, 1)
-    Bconst = ones(nc, 1)
+    layer = extract_reservoir_layer(d; layer = 1)
+    B = matern_trend_basis(layer)
+    nc = number_of_cells(layer.domain)
 
     prior = MaternSPDE2Prior(
         nc;
-        ρ0 = 1.75,
-        σ0 = 1.0,
-        range_basis = Bx,
-        anisotropy_u_basis = Bconst
+        basis = B,
+        range0 = 2.6,
+        sd0 = 1.0,
+        angle0 = 8*pi/180,
+        logratio0 = log(1.15),
+        diffusion_scheme = :fvm9
     )
-
     θ = (
-        range = [0.35],
-        anisotropy_u = [0.55]
+        range = Dict(:x => 0.18, :y => -0.10),
+        sd = Dict(:x => 0.05),
+        angle = Dict(:x => 6*pi/180, :y => -3*pi/180),
+        logratio = Dict(:x => 0.12, :y => 0.05)
     )
 
     fields = matern_parameter_fields(prior, θ)
-    detH = fields.H[1, :].*fields.H[3, :] .- fields.H[2, :].^2
-    @test all(isapprox.(detH, 1.0; atol = 1e-10))
-    @test all(fields.H[1, :] .> 0)
-    @test all(fields.H[3, :] .> 0)
+    op = @test_logs (:warn, r"No MaternCalibration provided") matern_spde_operator(layer, prior, θ)
 
-    anchor = nearest_cell_2d(d, 2.5, 2.5)
-    ranges0 = matern_realized_ranges(d, prior, θ; anchors = [anchor], compensated = false)
-    ratio_target = ranges0.target_major[1] / ranges0.target_minor[1]
-    ratio_realized0 = ranges0.realized_major[1] / ranges0.realized_minor[1]
-    @test ranges0.realized_major[1] > ranges0.realized_minor[1]
-
-    var0 = matern_realized_variance(d, prior, θ; anchors = :all, compensated = false)
-    sd_err0 = mean(abs.(log.(var0.realized ./ var0.target)))
-
-    matern_sd_compensation!(prior, d; anchors = :all)
-    var1 = matern_realized_variance(d, prior, θ; anchors = :all, compensated = true)
-    sd_err1 = mean(abs.(log.(var1.realized ./ var1.target)))
-    @test sd_err1 <= sd_err0 + 1e-8
-
-    left_anchor = nearest_cell_2d(d, minimum(cc[1, :]) + 0.5, 2.5)
-    right_anchor = nearest_cell_2d(d, maximum(cc[1, :]) - 0.5, 2.5)
-    ranges_geom0 = matern_realized_ranges(d, prior, θ; anchors = [left_anchor, right_anchor], compensated = true)
-    geom_err0 = mean(abs.(log.(sqrt.(ranges_geom0.realized_major .* ranges_geom0.realized_minor) ./ sqrt.(ranges_geom0.target_major .* ranges_geom0.target_minor))))
-    ratio_err0 = abs(log(ratio_realized0 / ratio_target))
-
-    matern_range_compensation!(prior, d; anchors = :all, corr_level = 0.2)
-    ranges1 = matern_realized_ranges(d, prior, θ; anchors = [anchor], compensated = true)
-    ratio_realized1 = ranges1.realized_major[1] / ranges1.realized_minor[1]
-    ratio_err1 = abs(log(ratio_realized1 / (ranges1.target_major[1] / ranges1.target_minor[1])))
-    @test ratio_err1 <= ratio_err0 + 1e-8
-
-    ranges_geom1 = matern_realized_ranges(d, prior, θ; anchors = [left_anchor, right_anchor], compensated = true)
-    geom_err1 = mean(abs.(log.(sqrt.(ranges_geom1.realized_major .* ranges_geom1.realized_minor) ./ sqrt.(ranges_geom1.target_major .* ranges_geom1.target_minor))))
-    @test geom_err1 <= geom_err0 + 1e-8
+    @test maximum(fields.ρ) > minimum(fields.ρ)
+    @test maximum(fields.σ) > minimum(fields.σ)
+    @test maximum(fields.ratio) > minimum(fields.ratio)
+    @test maximum(abs.(fields.orientation .- fields.orientation[1])) > 0.0
+    @test all(fields.ratio .>= 1.0)
+    @test op.calibration_status == :missing_fallback
+    @test size(op.Q, 1) == nc
 end
 
-@testset "matern spde halo operator" begin
-    g = CartesianMesh((5, 5), (5.0, 5.0))
+@testset "matern spde rotated anisotropy fvm9" begin
+    g = CartesianMesh((15, 15, 2), (15.0, 15.0, 2.0))
     d = reservoir_domain(g, permeability = 1.0, porosity = 0.2)
-    nc = number_of_cells(d)
-    prior = MaternSPDE2Prior(nc; ρ0 = 2.5, σ0 = 1.0)
-    halo = MaternHaloSpec(layers = 2, growth = 1.0)
+    layer = extract_reservoir_layer(d; layer = 1)
+    nc = number_of_cells(layer.domain)
 
-    op0 = matern_spde_operator(d, prior; compensated = false)
-    op = matern_spde_operator(d, prior; compensated = false, halo = halo)
+    prior_tpfa = MaternSPDE2Prior(nc; range0 = 3.0, sd0 = 1.0, angle0 = pi/6, logratio0 = log(2.0))
+    @test_throws ArgumentError matern_spde_operator(layer, prior_tpfa)
 
-    @test op.interior_idx == collect(1:nc)
-    @test !isempty(op.halo_idx)
-    @test size(op.Q, 1) == nc + length(op.halo_idx)
-    @test size(op.L_H, 1) == size(op.Q, 1)
-    @test issymmetric(Matrix(op.Q))
-    @test minimum(eigvals(Symmetric(Matrix(op.Q)))) > 0
-    @test op.transmissibilities ≈ op0.transmissibilities
+    prior = MaternSPDE2Prior(nc; range0 = 3.0, sd0 = 1.0, angle0 = pi/6, logratio0 = log(2.0), diffusion_scheme = :fvm9)
+    cal = matern_calibrate(layer, prior; maxiter = 12, tolerances = (variance = 0.08, geometric_range = 0.08, axis_ratio = 0.08, angle = 3pi/180))
+    op = matern_spde_operator(layer, prior; calibration = cal, strict = true)
+    vd = matern_realized_variance(layer, prior; anchors = cal.anchors, calibration = cal, strict = true)
+    rd = matern_realized_ranges(layer, prior; anchors = cal.anchors, calibration = cal, strict = true, corr_level = cal.corr_level)
 
-    halo_source = op.halo_meta.halo_source
-    @test op.fields.κ_eff[op.halo_idx] ≈ op.fields.κ_eff[halo_source]
-    @test op.fields.τ[op.halo_idx] ≈ op.fields.τ[halo_source]
-    @test size(op.halo_meta.ext_centroids, 2) == size(op.Q, 1)
+    geom_target = sqrt.(rd.target_major .* rd.target_minor)
+    geom_realized = sqrt.(rd.realized_major .* rd.realized_minor)
+    ratio_realized = rd.realized_major ./ rd.realized_minor
+    angle_error = abs.(JutulDarcy._orientation_difference.(rd.realized_angle, rd.target_angle))
 
-    side_faces = op.halo_meta.side_faces
-    if !isempty(side_faces[:south]) && !isempty(side_faces[:west])
-        south_face = first(side_faces[:south])
-        west_face = first(side_faces[:west])
-        south_halo = op.halo_meta.face_to_chain[south_face][1]
-        west_halo = op.halo_meta.face_to_chain[west_face][1]
-        @test Matrix(op.L_H)[south_halo, west_halo] < 0
+    @test op.calibration_status == :applied
+    @test isempty(op.halo_idx)
+    @test maximum(abs.(vd.realized ./ vd.target .- 1.0)) <= cal.tolerances.variance + 1e-8
+    @test maximum(abs.(geom_realized ./ geom_target .- 1.0)) <= cal.tolerances.geometric_range + 1e-8
+    @test maximum(abs.(ratio_realized ./ rd.target_ratio .- 1.0)) <= cal.tolerances.axis_ratio + 1e-8
+    @test maximum(angle_error) <= cal.tolerances.angle + 1e-8
+end
+
+@testset "matern spde fvm9 nonstationary rotated fields and anchors" begin
+    g = CartesianMesh((15, 15, 2), (15.0, 15.0, 2.0))
+    d = reservoir_domain(g, permeability = 1.0, porosity = 0.2)
+    layer = extract_reservoir_layer(d; layer = 1)
+    B = matern_trend_basis(layer)
+    nc = number_of_cells(layer.domain)
+
+    prior = MaternSPDE2Prior(
+        nc;
+        basis = B,
+        range0 = 3.0,
+        sd0 = 1.0,
+        angle0 = pi/9,
+        logratio0 = log(1.5),
+        diffusion_scheme = :fvm9
+    )
+    θ = (
+        range = Dict(:x => 0.10, :y => -0.05),
+        sd = Dict(:x => 0.03, :y => -0.02),
+        angle = Dict(:x => 0.08, :y => -0.04),
+        logratio = Dict(:x => 0.06, :y => 0.02)
+    )
+
+    fields = matern_parameter_fields(prior, θ)
+    anchors = JutulDarcy._matern_auto_anchors(layer, fields.ρ_major; resolution = (2, 2))
+    op = @test_logs (:warn, r"No MaternCalibration provided") matern_spde_operator(layer, prior, θ)
+    rd = matern_realized_ranges(layer, prior, θ; anchors = anchors)
+
+    nx, ny = layer.parent_shape
+    anchor_ij = map(a -> (mod1(layer.active_parent_linear[a], nx), fld(layer.active_parent_linear[a] - 1, nx) + 1), anchors)
+    @test all(anchor_ij) do ij
+        i, j = ij
+        1 < i < nx && 1 < j < ny
     end
+    @test maximum(fields.ratio) > minimum(fields.ratio)
+    @test maximum(abs.(fields.orientation .- fields.orientation[1])) > 0.0
+    @test maximum(abs.(JutulDarcy._orientation_difference.(rd.realized_angle, rd.target_angle))) < 10pi/180
+    @test size(op.Q, 1) == nc
+end
 
-    center = nearest_cell_2d(d, 2.5, 2.5)
-    west = nearest_cell_2d(d, minimum(d[:cell_centroids][1, :]) + 0.5, 2.5)
-    var0 = matern_realized_variance(d, prior; anchors = [center, west], compensated = false)
-    varh = matern_realized_variance(d, prior; anchors = [center, west], compensated = false, halo = halo)
-    err0 = abs(log(var0.realized[2]/var0.realized[1]))
-    errh = abs(log(varh.realized[2]/varh.realized[1]))
-    @test errh <= err0 + 1e-8
+@testset "matern spde explicit calibration" begin
+    g = CartesianMesh((15, 15, 2), (15.0, 15.0, 2.0))
+    d = reservoir_domain(g, permeability = 1.0, porosity = 0.2)
+    layer = extract_reservoir_layer(d; layer = 1)
+    prior = MaternSPDE2Prior(number_of_cells(layer.domain); range0 = 2.5, sd0 = 1.0)
 
-    varh0 = matern_realized_variance(d, prior; anchors = :all, compensated = false, halo = halo)
-    scale_err0 = abs(mean(log.(varh0.realized ./ varh0.target)))
+    cal = matern_calibrate(layer, prior)
+    op = matern_spde_operator(layer, prior; calibration = cal, strict = true)
+    vd = matern_realized_variance(layer, prior; anchors = cal.anchors, calibration = cal, strict = true)
+    rd = matern_realized_ranges(layer, prior; anchors = cal.anchors, calibration = cal, strict = true, corr_level = cal.corr_level)
 
-    matern_sd_compensation!(prior, d; anchors = :all, mode = :mean, halo = halo)
-    varh1 = matern_realized_variance(d, prior; anchors = :all, compensated = true, halo = halo)
-    scale_err1 = abs(mean(log.(varh1.realized ./ varh1.target)))
-    @test scale_err1 <= scale_err0 + 1e-8
+    geom_target = sqrt.(rd.target_major .* rd.target_minor)
+    geom_realized = sqrt.(rd.realized_major .* rd.realized_minor)
+    ratio_realized = rd.realized_major ./ rd.realized_minor
+
+    @test op.calibration_status == :applied
+    @test !isempty(op.halo_idx)
+    @test cal.anchor_resolution == (1, 1)
+    @test maximum(abs.(vd.realized ./ vd.target .- 1.0)) <= cal.tolerances.variance + 1e-8
+    @test maximum(abs.(geom_realized ./ geom_target .- 1.0)) <= cal.tolerances.geometric_range + 1e-8
+    @test maximum(abs.(ratio_realized ./ rd.target_ratio .- 1.0)) <= cal.tolerances.axis_ratio + 1e-8
+    @test_throws ArgumentError matern_spde_operator(layer, prior; calibration = cal, strict = true, halo = MaternHaloSpec(layers = 2, growth = 1.0))
+end
+
+@testset "matern real-input smoke" begin
+    pth = JutulDarcy.GeoEnergyIO.test_input_file_path("SPE1", "SPE1.DATA")
+    layer = extract_reservoir_layer(pth; layer = 1)
+    cc = layer.domain[:cell_centroids]
+    lx = maximum(cc[1, :]) - minimum(cc[1, :])
+    ly = maximum(cc[2, :]) - minimum(cc[2, :])
+    range0 = 0.15 * min(lx, ly)
+
+    prior = MaternSPDE2Prior(number_of_cells(layer.domain); range0 = range0, sd0 = 1.0)
+    cal = matern_calibrate(layer, prior; anchor_resolution = (3, 3))
+    op = matern_spde_operator(layer, prior; calibration = cal, strict = true)
+
+    @test layer.layer == 1
+    @test number_of_cells(layer.domain) > 0
+    @test size(op.Q, 1) > number_of_cells(layer.domain)
+    @test op.calibration_status == :applied
+end
+
+@testset "matern data-file precision api" begin
+    pth = JutulDarcy.GeoEnergyIO.test_input_file_path("SPE1", "SPE1.DATA")
+    layer = extract_reservoir_layer(pth; layer = 1)
+    nc = number_of_cells(layer.domain)
+    cc = layer.domain[:cell_centroids]
+    lx = maximum(cc[1, :]) - minimum(cc[1, :])
+    ly = maximum(cc[2, :]) - minimum(cc[2, :])
+    range0 = 0.20 * min(lx, ly)
+
+    Q = @test_logs (:warn, r"No MaternCalibration provided") matern_precision_from_data_file(
+        pth;
+        target_variance = 1.5,
+        target_range = range0,
+        calibrate = false
+    )
+    csc = @test_logs (:warn, r"No MaternCalibration provided") matern_precision_csc_from_data_file(
+        pth;
+        target_variance = 1.5,
+        target_range = range0,
+        calibrate = false
+    )
+
+    @test Q isa SparseMatrixCSC
+    @test size(Q) == (nc, nc)
+    @test csc.shape == (nc, nc)
+    @test length(csc.colptr) == nc + 1
+    @test length(csc.rowval) == length(csc.nzval) == nnz(Q)
+    @test minimum(csc.rowval) >= 1
+    @test length(csc.domain_mask) == size(Q, 1)
+    @test count(csc.domain_mask) == nc
+    @test csc.interior_idx == collect(1:nc)
+    @test isempty(csc.halo_idx)
+
+    csc_cal = matern_precision_csc_from_data_file(
+        pth;
+        target_variance = 1.0,
+        target_range = range0
+    )
+    @test csc_cal.shape[1] > nc
+    @test length(csc_cal.domain_mask) == csc_cal.shape[1]
+    @test count(csc_cal.domain_mask) == nc
+    @test all(csc_cal.domain_mask[csc_cal.interior_idx])
+    @test all(.!csc_cal.domain_mask[csc_cal.halo_idx])
+
+    @test_throws ArgumentError matern_precision_from_data_file(
+        pth;
+        target_variance = [1.0, 1.1],
+        target_range = range0,
+        calibrate = false
+    )
+
+    Qns = @test_logs (:warn, r"No MaternCalibration provided") matern_precision_from_data_file(
+        pth;
+        target_variance = fill(1.0, nc),
+        target_range = fill(range0, nc),
+        target_rotation = collect(range(0.0, stop = pi/6, length = nc)),
+        target_anisotropy = 2.0,
+        angle_unit = :radian,
+        calibrate = false
+    )
+    @test Qns isa SparseMatrixCSC
+    @test size(Qns) == (nc, nc)
 end
 
 @testset "matern spde 3d stationary operator" begin

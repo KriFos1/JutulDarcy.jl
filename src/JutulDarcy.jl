@@ -39,16 +39,30 @@ module JutulDarcy
     export reservoir_model
     export tpfa_stencil_quantities
     export tpfa_laplacian
+    export ReservoirLayerDomain
+    export extract_reservoir_layer
+    export MaternBasis
+    export MaternBasisFit
+    export combine_matern_basis
+    export matern_trend_basis
+    export matern_region_basis
+    export matern_raster_basis
+    export matern_identity_basis
+    export fit_matern_fields
     export MaternSPDE2Prior
     export MaternSPDE3Prior
     export MaternHaloSpec
+    export MaternCalibration
     export matern_parameter_fields
     export matern_spde_operator
+    export matern_calibrate
     export matern_sd_compensation!
     export matern_range_compensation!
     export matern_realized_variance
     export matern_realized_ranges
     export matern_realized_axis_ranges
+    export matern_precision_from_data_file
+    export matern_precision_csc_from_data_file
     export setup_reservoir_model
     export setup_reservoir_simulator
     export simulate_reservoir
@@ -168,6 +182,7 @@ module JutulDarcy
     include("deck_types.jl")
     include("porousmedia_grids.jl")
     include("utils.jl")
+    include("matern_layer.jl")
     include("matern_spde.jl")
     include("matern_spde_3d.jl")
     include("state0.jl")
