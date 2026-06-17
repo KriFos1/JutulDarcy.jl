@@ -268,6 +268,9 @@ module JutulDarcy
     # Plotting utilities for wells
     include("WellBorePlotting/WellBorePlotting.jl")
 
+    # Validation utilities
+    include("CaseValidation/CaseValidation.jl")
+
 
     @compile_workload begin
         try
