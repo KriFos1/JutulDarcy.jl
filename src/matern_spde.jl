@@ -242,7 +242,7 @@ function matern_precision_from_data_file(
         tolerances = _default_matern_tolerances(),
         maxiter::Integer = 10
     )
-    op = _matern_precision_operator_from_data_file(
+    op, _ = _matern_precision_operator_from_data_file(
         data_path;
         layer = layer,
         target_variance = target_variance,
@@ -314,7 +314,8 @@ function matern_calibrate(
     !isnothing(halo_eff) && _validate_matern_halo(domain, prior, halo_eff)
     fields = matern_parameter_fields(prior, θ)
     stationary = _matern_fields_stationary(fields)
-    actual_anchor_resolution = anchors === :auto ? (Int(anchor_resolution[1]), Int(anchor_resolution[2])) : (Int(anchor_resolution[1]), Int(anchor_resolution[2]))
+    requested_anchor_resolution = (Int(anchor_resolution[1]), Int(anchor_resolution[2]))
+    actual_anchor_resolution = anchors === :auto && stationary ? (1, 1) : requested_anchor_resolution
     idx = if anchors === :auto
         stationary ? _matern_central_anchor(layer_or_domain, fields.ρ_major) : _matern_auto_anchors(layer_or_domain, fields.ρ_major; resolution = actual_anchor_resolution)
     else
