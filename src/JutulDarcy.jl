@@ -63,6 +63,8 @@ module JutulDarcy
     export matern_realized_axis_ranges
     export matern_precision_from_data_file
     export matern_precision_csc_from_data_file
+    export matern_precision_from_data_file_3d
+    export matern_precision_csc_from_data_file_3d
     export setup_reservoir_model
     export setup_reservoir_simulator
     export simulate_reservoir
@@ -187,6 +189,7 @@ module JutulDarcy
     include("matern_layer.jl")
     include("matern_spde.jl")
     include("matern_spde_3d.jl")
+    include("matern_spde_3d_api.jl")
     include("state0.jl")
     include("interpolation.jl")
     # Definitions for multiphase flow

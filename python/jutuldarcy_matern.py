@@ -96,6 +96,67 @@ open(output_path, "w") do io
 end
 """
 
+_JULIA_SUBPROCESS_CODE_3D = r"""
+using JutulDarcy
+using MAT
+
+input_path = ARGS[1]
+output_path = ARGS[2]
+data_path = ARGS[3]
+angle_unit = Symbol(ARGS[4])
+diffusion_scheme = Symbol(ARGS[5])
+boundary = Symbol(ARGS[6])
+nugget_raw = ARGS[7]
+nugget = nugget_raw == "nothing" ? nothing : parse(Float64, nugget_raw)
+
+input = matread(input_path)
+
+function mat_scalar(x)
+    return x isa AbstractArray ? first(x) : x
+end
+
+function mat_target(input, key::String, has_key::String)
+    has = Bool(mat_scalar(input[has_key]))
+    has || return nothing
+    raw = input[key]
+    x = raw isa AbstractArray ? vec(Float64.(raw)) : Float64[Float64(raw)]
+    return length(x) == 1 ? x[1] : x
+end
+
+data = JutulDarcy.matern_precision_csc_from_data_file_3d(
+    data_path;
+    target_variance = mat_target(input, "target_variance", "has_target_variance"),
+    target_range = mat_target(input, "target_range", "has_target_range"),
+    target_range_major = mat_target(input, "target_range_major", "has_target_range_major"),
+    target_range_minor = mat_target(input, "target_range_minor", "has_target_range_minor"),
+    target_range_vertical = mat_target(input, "target_range_vertical", "has_target_range_vertical"),
+    target_azimuth = mat_target(input, "target_azimuth", "has_target_azimuth"),
+    target_dip = mat_target(input, "target_dip", "has_target_dip"),
+    target_rake = mat_target(input, "target_rake", "has_target_rake"),
+    angle_unit = angle_unit,
+    diffusion_scheme = diffusion_scheme,
+    boundary = boundary,
+    nugget = nugget
+)
+
+open(output_path, "w") do io
+    write(io, Int64(data.shape[1]))
+    write(io, Int64(data.shape[2]))
+    write(io, Int64(length(data.nzval)))
+    write(io, Int64.(data.colptr))
+    write(io, Int64.(data.rowval))
+    write(io, Float64.(data.nzval))
+    write(io, UInt8.(data.domain_mask))
+    write(io, Int64(data.grid_ni))
+    write(io, Int64(data.grid_nj))
+    write(io, Int64(data.grid_nk))
+    write(io, Int64(data.n_halo))
+    write(io, Int8.(data.grid_mask))
+    write(io, Int64(size(data.parent_centroids, 1)))
+    write(io, Float64.(data.parent_centroids))
+end
+"""
+
 
 def matern_precision_from_data_file(
     data_path: str | Path,
@@ -227,6 +288,75 @@ def matern_precision_from_data_file(
     )
 
 
+def matern_precision_from_data_file_3d(
+    data_path: str | Path,
+    *,
+    target_variance: Any,
+    target_range: Any | None = None,
+    target_range_major: Any | None = None,
+    target_range_minor: Any | None = None,
+    target_range_vertical: Any | None = None,
+    target_azimuth: Any = 0.0,
+    target_dip: Any = 0.0,
+    target_rake: Any = 0.0,
+    angle_unit: str = "degree",
+    diffusion_scheme: str = "auto",
+    boundary: str = "robin",
+    nugget: float | None = None,
+    julia_project: str | Path | None = None,
+    backend: str | None = None,
+    return_mask: bool = False,
+    return_geometry: bool = False,
+) -> csc_matrix | tuple:
+    """Build a full-3D Matérn SPDE precision matrix from a ``.DATA`` file.
+
+    Ranges are principal practical ranges. If ``target_range`` is provided it
+    is used for all three principal axes unless an axis-specific range is also
+    provided. Angles use ``angle_unit`` and map to azimuth/dip/rake rotations.
+    """
+    backend = backend or os.environ.get("JUTULDARCY_MATERN_BACKEND", _DEFAULT_BACKEND)
+    if backend == "subprocess":
+        return _matern_precision_subprocess_3d(
+            data_path,
+            target_variance=target_variance,
+            target_range=target_range,
+            target_range_major=target_range_major,
+            target_range_minor=target_range_minor,
+            target_range_vertical=target_range_vertical,
+            target_azimuth=target_azimuth,
+            target_dip=target_dip,
+            target_rake=target_rake,
+            angle_unit=angle_unit,
+            diffusion_scheme=diffusion_scheme,
+            boundary=boundary,
+            nugget=nugget,
+            julia_project=julia_project,
+            return_mask=return_mask,
+            return_geometry=return_geometry,
+        )
+    if backend != "juliacall":
+        raise ValueError("backend must be 'subprocess' or 'juliacall'")
+
+    jl = _julia(julia_project)
+    jl_kwargs = dict(
+        target_variance=_target_value(target_variance),
+        target_range=_target_value(target_range),
+        target_range_major=_target_value(target_range_major),
+        target_range_minor=_target_value(target_range_minor),
+        target_range_vertical=_target_value(target_range_vertical),
+        target_azimuth=_target_value(target_azimuth),
+        target_dip=_target_value(target_dip),
+        target_rake=_target_value(target_rake),
+        angle_unit=jl.Symbol(angle_unit),
+        diffusion_scheme=jl.Symbol(diffusion_scheme),
+        boundary=jl.Symbol(boundary),
+    )
+    if nugget is not None:
+        jl_kwargs["nugget"] = float(nugget)
+    data = jl.JutulDarcy.matern_precision_csc_from_data_file_3d(str(data_path), **jl_kwargs)
+    return _result_from_julia_3d(data, return_mask=return_mask, return_geometry=return_geometry)
+
+
 def _matern_precision_subprocess(
     data_path: str | Path,
     *,
@@ -289,6 +419,67 @@ def _matern_precision_subprocess(
         )
 
 
+def _matern_precision_subprocess_3d(
+    data_path: str | Path,
+    *,
+    target_variance: Any,
+    target_range: Any | None,
+    target_range_major: Any | None,
+    target_range_minor: Any | None,
+    target_range_vertical: Any | None,
+    target_azimuth: Any,
+    target_dip: Any,
+    target_rake: Any,
+    angle_unit: str,
+    diffusion_scheme: str,
+    boundary: str,
+    nugget: float | None,
+    julia_project: str | Path | None,
+    return_mask: bool,
+    return_geometry: bool,
+) -> csc_matrix | tuple:
+    project = _resolve_project(julia_project)
+    julia = os.environ.get("JULIA", "julia")
+    with tempfile.TemporaryDirectory(prefix="jutuldarcy_matern3d_") as tmp:
+        input_path = Path(tmp) / "input.mat"
+        output_path = Path(tmp) / "output.cscbin"
+        savemat(input_path, _subprocess_input_payload_3d(
+            target_variance=target_variance,
+            target_range=target_range,
+            target_range_major=target_range_major,
+            target_range_minor=target_range_minor,
+            target_range_vertical=target_range_vertical,
+            target_azimuth=target_azimuth,
+            target_dip=target_dip,
+            target_rake=target_rake,
+        ))
+        cmd = [
+            julia,
+            f"--project={project}",
+            "--compiled-modules=existing",
+            "-e",
+            _JULIA_SUBPROCESS_CODE_3D,
+            str(input_path),
+            str(output_path),
+            str(data_path),
+            str(angle_unit),
+            str(diffusion_scheme),
+            str(boundary),
+            "nothing" if nugget is None else str(float(nugget)),
+        ]
+        completed = subprocess.run(cmd, text=True, capture_output=True)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "Julia subprocess failed while building the 3D Matérn precision "
+                f"matrix.\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+            )
+        return _scipy_csc_from_binary_3d(
+            output_path,
+            return_mask=return_mask,
+            return_geometry=return_geometry,
+        )
+
+
 def _subprocess_input_payload(
     *,
     target_variance: Any,
@@ -318,6 +509,15 @@ def _subprocess_input_payload(
         payload[f"has_tol_{tk}"] = np.array(
             [[has_tol and tk in tolerances]], dtype=np.uint8
         )
+    return payload
+
+
+def _subprocess_input_payload_3d(**targets: Any) -> dict[str, np.ndarray]:
+    payload: dict[str, np.ndarray] = {}
+    for key, value in targets.items():
+        has_key = f"has_{key}"
+        payload[has_key] = np.array([[value is not None]], dtype=np.uint8)
+        payload[key] = _target_array(0.0 if value is None else value)
     return payload
 
 
@@ -422,6 +622,13 @@ def _result_from_julia(data, *, return_mask: bool, return_geometry: bool) -> csc
     return _format_result(Q, mask, geometry, return_mask, return_geometry)
 
 
+def _result_from_julia_3d(data, *, return_mask: bool, return_geometry: bool) -> csc_matrix | tuple:
+    Q = _scipy_csc_from_julia(data)
+    mask = _grid_mask_from_julia_3d(data) if return_mask or return_geometry else None
+    geometry = _grid_geometry_from_julia_3d(data) if return_geometry else None
+    return _format_result(Q, mask, geometry, return_mask, return_geometry)
+
+
 def _format_result(
     Q: csc_matrix,
     mask: np.ndarray | None,
@@ -465,6 +672,28 @@ def _grid_geometry_from_julia(data) -> dict[str, np.ndarray]:
     if centroids.shape[0] > 2:
         geometry["z"] = centroids[2, :].reshape((ni, nj), order="F").copy()
     return geometry
+
+
+def _grid_mask_from_julia_3d(data) -> np.ndarray:
+    ni = int(np.asarray(_field(data, "grid_ni")).ravel()[0])
+    nj = int(np.asarray(_field(data, "grid_nj")).ravel()[0])
+    nk = int(np.asarray(_field(data, "grid_nk")).ravel()[0])
+    flat = np.asarray(_field(data, "grid_mask"), dtype=np.int8).ravel()
+    return flat.copy().reshape((ni, nj, nk), order="F")
+
+
+def _grid_geometry_from_julia_3d(data) -> dict[str, np.ndarray]:
+    ni = int(np.asarray(_field(data, "grid_ni")).ravel()[0])
+    nj = int(np.asarray(_field(data, "grid_nj")).ravel()[0])
+    nk = int(np.asarray(_field(data, "grid_nk")).ravel()[0])
+    centroids = np.asarray(_field(data, "parent_centroids"), dtype=float)
+    centroids = centroids.reshape((centroids.shape[0], ni * nj * nk), order="F")
+    return {
+        "centroids": centroids.copy(),
+        "x": centroids[0, :].reshape((ni, nj, nk), order="F").copy(),
+        "y": centroids[1, :].reshape((ni, nj, nk), order="F").copy(),
+        "z": centroids[2, :].reshape((ni, nj, nk), order="F").copy(),
+    }
 
 
 def _scipy_csc_from_julia(data) -> csc_matrix:
@@ -523,6 +752,53 @@ def _scipy_csc_from_binary(
     return _format_result(Q, mask, geometry, return_mask, return_geometry)
 
 
+def _scipy_csc_from_binary_3d(
+    path: Path,
+    *,
+    return_mask: bool,
+    return_geometry: bool,
+) -> csc_matrix | tuple:
+    with path.open("rb") as stream:
+        header = np.fromfile(stream, dtype=np.int64, count=3)
+        if header.size != 3:
+            raise RuntimeError(f"Invalid CSC output file {path}: missing header")
+        nrow, ncol, nnz = (int(x) for x in header)
+        colptr = np.fromfile(stream, dtype=np.int64, count=ncol + 1) - 1
+        rowval = np.fromfile(stream, dtype=np.int64, count=nnz) - 1
+        nzval = np.fromfile(stream, dtype=np.float64, count=nnz)
+        _domain_mask = np.fromfile(stream, dtype=np.uint8, count=nrow)
+        grid_header = np.fromfile(stream, dtype=np.int64, count=4)
+        ni, nj, nk, _n_halo = (int(x) for x in grid_header)
+        grid_mask = np.fromfile(stream, dtype=np.int8, count=ni * nj * nk)
+        geom_header = np.fromfile(stream, dtype=np.int64, count=1)
+        if geom_header.size == 1:
+            ncoord = int(geom_header[0])
+            parent_centroids = np.fromfile(stream, dtype=np.float64, count=ncoord * ni * nj * nk)
+        else:
+            ncoord = 0
+            parent_centroids = np.array([], dtype=float)
+    if colptr.size != ncol + 1 or rowval.size != nnz or nzval.size != nnz:
+        raise RuntimeError(f"Invalid CSC output file {path}: truncated arrays")
+    if _domain_mask.size != nrow:
+        raise RuntimeError(f"Invalid CSC output file {path}: missing domain mask")
+    if grid_mask.size != ni * nj * nk:
+        raise RuntimeError(f"Invalid CSC output file {path}: missing 3D grid mask")
+    if return_geometry and parent_centroids.size != ncoord * ni * nj * nk:
+        raise RuntimeError(f"Invalid CSC output file {path}: missing parent centroids")
+    Q = csc_matrix((nzval, rowval, colptr), shape=(nrow, ncol))
+    mask = grid_mask.reshape((ni, nj, nk), order="F") if return_mask or return_geometry else None
+    geometry = None
+    if return_geometry:
+        centroids = parent_centroids.reshape((ncoord, ni * nj * nk), order="F")
+        geometry = {
+            "centroids": centroids.copy(),
+            "x": centroids[0, :].reshape((ni, nj, nk), order="F").copy(),
+            "y": centroids[1, :].reshape((ni, nj, nk), order="F").copy(),
+            "z": centroids[2, :].reshape((ni, nj, nk), order="F").copy(),
+        }
+    return _format_result(Q, mask, geometry, return_mask, return_geometry)
+
+
 def realization_to_grid(
     x: np.ndarray,
     mask: np.ndarray,
@@ -563,6 +839,30 @@ def realization_to_grid(
     field_flat[flat == 1] = x[:n_active]
     field = field_flat.reshape(mask.shape, order="F")
     return np.ma.MaskedArray(field, mask=(mask != 1))
+
+
+def realization_to_grid_3d(
+    x: np.ndarray,
+    mask: np.ndarray,
+    *,
+    fill: float = np.nan,
+) -> np.ma.MaskedArray:
+    """Map a Q-space realization onto a full 3-D parent grid."""
+    x = np.asarray(x).ravel()
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim != 3:
+        raise ValueError(f"mask must be 3-D, got shape {mask_arr.shape}")
+    n_active = int((mask_arr == 1).sum())
+    if x.size < n_active:
+        raise ValueError(
+            f"x has {x.size} elements but the mask has {n_active} active cells"
+        )
+    field = np.full(mask_arr.shape, fill, dtype=float)
+    flat = mask_arr.ravel(order="F")
+    field_flat = field.ravel(order="F")
+    field_flat[flat == 1] = x[:n_active]
+    field = field_flat.reshape(mask_arr.shape, order="F")
+    return np.ma.MaskedArray(field, mask=(mask_arr != 1))
 
 
 def active_line_indices(
@@ -976,7 +1276,9 @@ __all__ = [
     "active_line_indices",
     "dense_inverse_line_values",
     "matern_precision_from_data_file",
+    "matern_precision_from_data_file_3d",
     "plot_dense_inverse_line",
     "realization_to_grid",
+    "realization_to_grid_3d",
     "sample_from_precision",
 ]

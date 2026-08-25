@@ -469,6 +469,28 @@ end
     )
     @test Qns isa SparseMatrixCSC
     @test size(Qns) == (nc, nc)
+
+    d3 = JutulDarcy._matern_full_3d_domain_from_data_file(pth)
+    nc3 = number_of_cells(d3)
+    Q3 = matern_precision_from_data_file_3d(
+        pth;
+        target_variance = 1.0,
+        target_range = range0,
+        diffusion_scheme = :tpfa,
+        boundary = :robin
+    )
+    csc3 = matern_precision_csc_from_data_file_3d(
+        pth;
+        target_variance = fill(1.0, nc3),
+        target_range = fill(range0, nc3),
+        diffusion_scheme = :tpfa,
+        boundary = :robin
+    )
+    @test Q3 isa SparseMatrixCSC
+    @test size(Q3) == (nc3, nc3)
+    @test csc3.shape == (nc3, nc3)
+    @test length(csc3.grid_mask) == csc3.grid_ni*csc3.grid_nj*csc3.grid_nk
+    @test count(csc3.domain_mask) == nc3
 end
 
 @testset "matern spde 3d stationary operator" begin
@@ -484,6 +506,45 @@ end
     @test Matrix(op.L_H) ≈ Matrix(L)
     @test op.fields.κ_eff ≈ fields.κ
     @test op.fields.τ ≈ fields.τ_nominal
+    @test issymmetric(Matrix(op.Q))
+    @test minimum(eigvals(Symmetric(Matrix(op.Q)))) > 0
+end
+
+@testset "matern spde 3d nonstationary rotated avgmpfa" begin
+    g = CartesianMesh((2, 2, 2), (2.0, 2.0, 2.0))
+    d = reservoir_domain(g, permeability = 1.0, porosity = 0.2)
+    nc = number_of_cells(d)
+    basis = MaternBasis(spdiagm(0 => ones(Float64, nc)))
+    ρ0 = 2.0
+    σ0 = 1.0
+    prior = MaternSPDE3Prior(
+        nc;
+        ρ0 = ρ0,
+        σ0 = σ0,
+        range_x_basis = basis,
+        range_y_basis = basis,
+        range_z_basis = basis,
+        sd_basis = basis,
+        azimuth_basis = basis,
+        diffusion_scheme = :avgmpfa
+    )
+    θ = (
+        range_x = log.(fill(3.0/ρ0, nc)),
+        range_y = log.(fill(1.5/ρ0, nc)),
+        range_z = log.(fill(1.0/ρ0, nc)),
+        sd = log.(collect(range(0.8, 1.2, length = nc)) ./ σ0),
+        azimuth = fill(pi/6, nc)
+    )
+    fields = matern_parameter_fields(prior, θ)
+    @test fields.ρ_x ≈ fill(3.0, nc)
+    @test fields.ρ_y ≈ fill(1.5, nc)
+    @test fields.ρ_z ≈ fill(1.0, nc)
+    @test size(fields.H) == (6, nc)
+    @test maximum(abs.(fields.H[2, :])) > 1e-8
+
+    op = matern_spde_operator(d, prior, θ; compensated = false, boundary = :robin)
+    @test op.diffusion_scheme == :avgmpfa
+    @test !(op.K isa Symmetric)
     @test issymmetric(Matrix(op.Q))
     @test minimum(eigvals(Symmetric(Matrix(op.Q)))) > 0
 end
@@ -552,6 +613,12 @@ end
     err1 = abs(mean(log.(var1.realized ./ var1.target)))
 
     @test err1 <= err0 + 1e-8
+
+    prior_robin = MaternSPDE3Prior(number_of_cells(d); ρ0 = 2.5, σ0 = 10.0)
+    matern_sd_compensation!(prior_robin, d; anchors = :all, mode = :mean, boundary = :robin)
+    var_robin = matern_realized_variance(d, prior_robin; anchors = :all, compensated = true, boundary = :robin)
+    err_robin = abs(mean(log.(var_robin.realized ./ var_robin.target)))
+    @test err_robin < 0.02
 end
 
 @testset "matern spde 3d axis ranges" begin

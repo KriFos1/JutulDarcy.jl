@@ -1,4 +1,4 @@
-mutable struct MaternSPDE3Prior{T<:AbstractFloat, M<:AbstractMatrix{T}}
+mutable struct MaternSPDE3Prior{T<:AbstractFloat}
     nc::Int
     ν::T
     ρ0::T
@@ -6,8 +6,19 @@ mutable struct MaternSPDE3Prior{T<:AbstractFloat, M<:AbstractMatrix{T}}
     κ_min::T
     laplace_from::Symbol
     version::Symbol
-    anisotropy_a_basis::M
-    anisotropy_b_basis::M
+    anisotropy_a_basis::AbstractMatrix{T}
+    anisotropy_b_basis::AbstractMatrix{T}
+    range_x_basis::AbstractMatrix{T}
+    range_y_basis::AbstractMatrix{T}
+    range_z_basis::AbstractMatrix{T}
+    sd_basis::AbstractMatrix{T}
+    azimuth0::T
+    dip0::T
+    rake0::T
+    azimuth_basis::AbstractMatrix{T}
+    dip_basis::AbstractMatrix{T}
+    rake_basis::AbstractMatrix{T}
+    diffusion_scheme::Symbol
     sd_compensation::Any
 end
 
@@ -39,7 +50,19 @@ function MaternSPDE3Prior(
         laplace_from::Symbol = :geometry,
         version::Symbol = :xyz,
         anisotropy_a_basis = nothing,
-        anisotropy_b_basis = nothing
+        anisotropy_b_basis = nothing,
+        range_basis = nothing,
+        range_x_basis = range_basis,
+        range_y_basis = range_basis,
+        range_z_basis = range_basis,
+        sd_basis = nothing,
+        azimuth0::Real = 0.0,
+        dip0::Real = 0.0,
+        rake0::Real = 0.0,
+        azimuth_basis = nothing,
+        dip_basis = nothing,
+        rake_basis = nothing,
+        diffusion_scheme::Symbol = :auto
     )
     T = Float64
     νf = T(ν)
@@ -52,37 +75,75 @@ function MaternSPDE3Prior(
     κminf > 0 || throw(ArgumentError("κ_min must be positive, got $κ_min."))
     laplace_from in (:geometry, :flow, :unit) || throw(ArgumentError("laplace_from must be one of :geometry, :flow, :unit (got $laplace_from)."))
     version == :xyz || throw(ArgumentError("The 3D Matérn SPDE implementation currently only supports version = :xyz (got $version)."))
+    diffusion_scheme in (:auto, :tpfa, :avgmpfa) || throw(ArgumentError("diffusion_scheme must be one of :auto, :tpfa, :avgmpfa (got $diffusion_scheme)."))
     Ba = _matern_basis_matrix(anisotropy_a_basis, nc, T)
     Bb = _matern_basis_matrix(anisotropy_b_basis, nc, T)
-    return MaternSPDE3Prior(Int(nc), νf, ρ0f, σ0f, κminf, laplace_from, version, Ba, Bb, nothing)
+    Brx = _matern_basis_matrix(range_x_basis, nc, T)
+    Bry = _matern_basis_matrix(range_y_basis, nc, T)
+    Brz = _matern_basis_matrix(range_z_basis, nc, T)
+    Bs = _matern_basis_matrix(sd_basis, nc, T)
+    Baz = _matern_basis_matrix(azimuth_basis, nc, T)
+    Bd = _matern_basis_matrix(dip_basis, nc, T)
+    Br = _matern_basis_matrix(rake_basis, nc, T)
+    return MaternSPDE3Prior(
+        Int(nc), νf, ρ0f, σ0f, κminf, laplace_from, version,
+        Ba, Bb, Brx, Bry, Brz, Bs, T(azimuth0), T(dip0), T(rake0), Baz, Bd, Br,
+        diffusion_scheme, nothing
+    )
 end
 
 function _normalize_matern_theta_3d(prior::MaternSPDE3Prior, θ)
-    θ isa NamedTuple || throw(ArgumentError("θ must be a named tuple with optional fields :anisotropy_a, :anisotropy_b."))
+    θ isa NamedTuple || throw(ArgumentError("θ must be a named tuple with optional 3D Matérn coefficient fields."))
     return (
         anisotropy_a = _theta_block(θ, :anisotropy_a, size(prior.anisotropy_a_basis, 2)),
-        anisotropy_b = _theta_block(θ, :anisotropy_b, size(prior.anisotropy_b_basis, 2))
+        anisotropy_b = _theta_block(θ, :anisotropy_b, size(prior.anisotropy_b_basis, 2)),
+        range_x = _theta_block(θ, :range_x, size(prior.range_x_basis, 2)),
+        range_y = _theta_block(θ, :range_y, size(prior.range_y_basis, 2)),
+        range_z = _theta_block(θ, :range_z, size(prior.range_z_basis, 2)),
+        sd = _theta_block(θ, :sd, size(prior.sd_basis, 2)),
+        azimuth = _theta_block(θ, :azimuth, size(prior.azimuth_basis, 2)),
+        dip = _theta_block(θ, :dip, size(prior.dip_basis, 2)),
+        rake = _theta_block(θ, :rake, size(prior.rake_basis, 2))
     )
 end
 
 function matern_parameter_fields(prior::MaternSPDE3Prior, θ = NamedTuple())
     θn = _normalize_matern_theta_3d(prior, θ)
-    ρ = fill(prior.ρ0, prior.nc)
-    σ = fill(prior.σ0, prior.nc)
-    κ = fill(max(sqrt(8*prior.ν)/prior.ρ0, prior.κ_min), prior.nc)
-    τ_nominal = _matern_tau_nominal(prior.ν, κ, σ; d = 3.0)
+    logρx = fill(log(prior.ρ0), prior.nc) .+ prior.range_x_basis * θn.range_x
+    logρy = fill(log(prior.ρ0), prior.nc) .+ prior.range_y_basis * θn.range_y
+    logρz = fill(log(prior.ρ0), prior.nc) .+ prior.range_z_basis * θn.range_z
+    logσ = fill(log(prior.σ0), prior.nc) .+ prior.sd_basis * θn.sd
 
+    ρx_base = exp.(logρx)
+    ρy_base = exp.(logρy)
+    ρz_base = exp.(logρz)
     a = prior.anisotropy_a_basis * θn.anisotropy_a
     b = prior.anisotropy_b_basis * θn.anisotropy_b
-    H = _matern_diagonal_anisotropy_3d(a, b)
+    ρx = ρx_base .* exp.(0.5 .* a)
+    ρy = ρy_base .* exp.(0.5 .* b)
+    ρz = ρz_base .* exp.(-0.5 .* (a .+ b))
+    ρ = (ρx .* ρy .* ρz).^(1/3)
+    σ = exp.(logσ)
+    κ = max.(sqrt(8*prior.ν) ./ ρ, prior.κ_min)
+    τ_nominal = _matern_tau_nominal(prior.ν, κ, σ; d = 3.0)
+    azimuth = fill(prior.azimuth0, prior.nc) .+ prior.azimuth_basis * θn.azimuth
+    dip = fill(prior.dip0, prior.nc) .+ prior.dip_basis * θn.dip
+    rake = fill(prior.rake0, prior.nc) .+ prior.rake_basis * θn.rake
+    H = _matern_tensor_from_ranges_3d(ρx, ρy, ρz, ρ, azimuth, dip, rake)
     return (
         θ = θn,
         ρ = ρ,
+        ρ_x = ρx,
+        ρ_y = ρy,
+        ρ_z = ρz,
         σ = σ,
         κ = κ,
         τ_nominal = τ_nominal,
         a = a,
         b = b,
+        azimuth = azimuth,
+        dip = dip,
+        rake = rake,
         H = H
     )
 end
@@ -103,6 +164,63 @@ function _matern_diagonal_anisotropy_3d(a::AbstractVector, b::AbstractVector)
         H[3, i] = exp(-(a[i] + b[i]))
     end
     return H
+end
+
+function _matern_rotation_matrix_3d(azimuth::Real, dip::Real, rake::Real)
+    ca, sa = cos(azimuth), sin(azimuth)
+    cd, sd = cos(dip), sin(dip)
+    cr, sr = cos(rake), sin(rake)
+    Rz = @SMatrix [ca -sa 0.0; sa ca 0.0; 0.0 0.0 1.0]
+    Ry = @SMatrix [cd 0.0 sd; 0.0 1.0 0.0; -sd 0.0 cd]
+    Rx = @SMatrix [1.0 0.0 0.0; 0.0 cr -sr; 0.0 sr cr]
+    return Rz * Ry * Rx
+end
+
+function _matern_tensor_from_ranges_3d(ρx, ρy, ρz, ρbase, azimuth, dip, rake)
+    n = length(ρbase)
+    H = Matrix{Float64}(undef, 6, n)
+    @inbounds for i in 1:n
+        λx = (ρx[i]/ρbase[i])^2
+        λy = (ρy[i]/ρbase[i])^2
+        λz = (ρz[i]/ρbase[i])^2
+        R = _matern_rotation_matrix_3d(azimuth[i], dip[i], rake[i])
+        Λ = @SMatrix [λx 0.0 0.0; 0.0 λy 0.0; 0.0 0.0 λz]
+        T = R * Λ * R'
+        H[1, i] = T[1, 1]
+        H[2, i] = T[1, 2]
+        H[3, i] = T[1, 3]
+        H[4, i] = T[2, 2]
+        H[5, i] = T[2, 3]
+        H[6, i] = T[3, 3]
+    end
+    return H
+end
+
+function _matern_diagonal_part_3d(H::AbstractMatrix)
+    size(H, 1) == 3 && return H
+    size(H, 1) == 6 || throw(ArgumentError("3D anisotropy tensor must have 3 or 6 rows, got $(size(H, 1))."))
+    D = Matrix{Float64}(undef, 3, size(H, 2))
+    D[1, :] .= H[1, :]
+    D[2, :] .= H[4, :]
+    D[3, :] .= H[6, :]
+    return D
+end
+
+function _matern_is_diagonal_tensor_3d(H::AbstractMatrix; atol::Real = 1e-12)
+    size(H, 1) == 3 && return true
+    size(H, 1) == 6 || return false
+    return maximum(abs.(view(H, 2, :))) <= atol &&
+           maximum(abs.(view(H, 3, :))) <= atol &&
+           maximum(abs.(view(H, 5, :))) <= atol
+end
+
+function _matern_resolve_diffusion_scheme_3d(prior::MaternSPDE3Prior, H::AbstractMatrix)
+    if prior.diffusion_scheme == :auto
+        return _matern_is_diagonal_tensor_3d(H) ? :tpfa : :avgmpfa
+    elseif prior.diffusion_scheme == :tpfa && !_matern_is_diagonal_tensor_3d(H)
+        throw(ArgumentError("diffusion_scheme = :tpfa cannot represent rotated 3D anisotropy. Use diffusion_scheme = :avgmpfa or :auto."))
+    end
+    return prior.diffusion_scheme
 end
 
 function matern_realized_ranges(domain::DataDomain, prior::MaternSPDE3Prior, θ = NamedTuple(); kwargs...)
@@ -181,8 +299,55 @@ Convert a `3 × nc` diagonal tensor to the 3-row permeability format expected
 by `reservoir_transmissibility`.
 """
 function _embed_diagonal_tensor_3d(H::AbstractMatrix)
-    size(H, 1) == 3 || throw(ArgumentError("H must have 3 rows, got $(size(H, 1))."))
-    return copy(H)
+    size(H, 1) in (3, 6) || throw(ArgumentError("H must have 3 or 6 rows, got $(size(H, 1))."))
+    return size(H, 1) == 3 ? copy(H) : _matern_diagonal_part_3d(H)
+end
+
+function _matern_laplacian_avgmpfa_3d(domain::DataDomain, prior::MaternSPDE3Prior, H::AbstractMatrix)
+    prior.laplace_from == :geometry || throw(ArgumentError("diffusion_scheme = :avgmpfa requires laplace_from = :geometry, got $(prior.laplace_from)."))
+    nc = number_of_cells(domain)
+    g = physical_representation(domain)
+    gu = g isa UnstructuredMesh ? g : UnstructuredMesh(g)
+    fallback = _matern_diffusion_transmissibility(domain, prior, (H = _matern_diagonal_part_3d(H),))
+    discs = Jutul.NFVM.ntpfa_decompose_faces(gu, H, :avgmpfa; tpfa_trans = fallback)
+
+    I = Int[]
+    J = Int[]
+    V = Float64[]
+    sizehint!(I, 12*length(discs))
+    sizehint!(J, 12*length(discs))
+    sizehint!(V, 12*length(discs))
+    function add!(row, col, val)
+        abs(val) <= 1e-14 && return nothing
+        1 <= row <= nc && 1 <= col <= nc || return nothing
+        push!(I, row); push!(J, col); push!(V, Float64(val))
+        return nothing
+    end
+    for disc in discs
+        l, r = Jutul.cell_pair(disc)
+        coeffs = Dict{Int, Float64}(l => Float64(disc.T_left), r => Float64(disc.T_right))
+        for (c, v) in disc.mpfa
+            coeffs[c] = get(coeffs, c, 0.0) + Float64(v)
+        end
+        for (c, v) in coeffs
+            add!(l, c, -v)
+            add!(r, c, v)
+        end
+    end
+    return sparse(I, J, V, nc, nc)
+end
+
+function _matern_robin_diagonal_3d(domain::DataDomain, κ::AbstractVector; scale::Real = 1.42)
+    diag = zeros(Float64, number_of_cells(domain))
+    haskey(domain, :boundary_neighbors) && haskey(domain, :boundary_areas) || return diag
+    bn = Int.(vec(domain[:boundary_neighbors]))
+    ba = Float64.(vec(domain[:boundary_areas]))
+    @inbounds for f in eachindex(bn)
+        c = bn[f]
+        c > 0 || continue
+        diag[c] += ba[f] * κ[c] / Float64(scale)
+    end
+    return diag
 end
 
 function _matern_extend_fields_3d(fields, source::AbstractVector{<:Integer}, κ_eff::AbstractVector, τ_eff::AbstractVector, logtau_offset::Real)
@@ -190,6 +355,9 @@ function _matern_extend_fields_3d(fields, source::AbstractVector{<:Integer}, κ_
     return (
         θ = fields.θ,
         ρ = vcat(fields.ρ, fields.ρ[source]),
+        ρ_x = vcat(fields.ρ_x, fields.ρ_x[source]),
+        ρ_y = vcat(fields.ρ_y, fields.ρ_y[source]),
+        ρ_z = vcat(fields.ρ_z, fields.ρ_z[source]),
         σ = vcat(fields.σ, fields.σ[source]),
         κ = vcat(fields.κ, fields.κ[source]),
         τ_nominal = vcat(fields.τ_nominal, fields.τ_nominal[source]),
@@ -198,25 +366,43 @@ function _matern_extend_fields_3d(fields, source::AbstractVector{<:Integer}, κ_
         logtau_offset = fill(Float64(logtau_offset), length(κ_eff) + length(source)),
         a = vcat(fields.a, isempty(source) ? Float64[] : fields.a[source]),
         b = vcat(fields.b, isempty(source) ? Float64[] : fields.b[source]),
+        azimuth = vcat(fields.azimuth, isempty(source) ? Float64[] : fields.azimuth[source]),
+        dip = vcat(fields.dip, isempty(source) ? Float64[] : fields.dip[source]),
+        rake = vcat(fields.rake, isempty(source) ? Float64[] : fields.rake[source]),
         H = H_ext
     )
 end
 
 """
-    matern_spde_operator(domain, prior::MaternSPDE3Prior, θ = NamedTuple(); compensated = true, halo = nothing)
+    matern_spde_operator(domain, prior::MaternSPDE3Prior, θ = NamedTuple(); compensated = true, halo = nothing, boundary = :none)
 
 Assemble the 3D finite-volume Matérn SPDE operator for `α = 2`:
 
-`Q = Dτ * K * C^-1 * K * Dτ`, with `K = L + Diagonal(volumes .* κ.^2)`.
+`Q = Dτ * K' * C^-1 * K * Dτ`, with `K = L + Diagonal(volumes .* κ.^2)`.
+For the TPFA path `K` is symmetric and the existing K-solve diagnostics remain
+available. Rotated full-tensor anisotropy uses Jutul NFVM avgMPFA and the
+normal-equations form above.
 """
-function matern_spde_operator(domain::DataDomain, prior::MaternSPDE3Prior, θ = NamedTuple(); compensated::Bool = true, halo = nothing)
+function matern_spde_operator(
+        domain::DataDomain,
+        prior::MaternSPDE3Prior,
+        θ = NamedTuple();
+        compensated::Bool = true,
+        halo = nothing,
+        boundary::Symbol = :none,
+        robin_scale::Real = 1.42
+    )
     _validate_matern_domain(domain, prior)
+    boundary in (:none, :robin) || throw(ArgumentError("boundary must be :none or :robin, got $boundary."))
     if !isnothing(halo)
         halo isa MaternHaloSpec || throw(ArgumentError("halo must be nothing or a MaternHaloSpec, got $(typeof(halo))."))
+        boundary == :none || throw(ArgumentError("3D halo padding and boundary = :robin cannot be combined."))
         _validate_matern_halo(domain, prior, halo, compensated)
     end
 
     fields = matern_parameter_fields(prior, θ)
+    scheme = _matern_resolve_diffusion_scheme_3d(prior, fields.H)
+    !isnothing(halo) && scheme != :tpfa && throw(ArgumentError("3D halo padding is only supported with diffusion_scheme = :tpfa; got $scheme."))
     κ_eff = copy(fields.κ)
     T = _matern_diffusion_transmissibility(domain, prior, fields)
     N = domain[:neighbors]
@@ -234,12 +420,12 @@ function matern_spde_operator(domain::DataDomain, prior::MaternSPDE3Prior, θ = 
     interior_idx = collect(1:nc)
 
     if isnothing(halo)
-        L_H = tpfa_laplacian(N, T, nc)
+        L_H = scheme == :tpfa ? tpfa_laplacian(N, T, nc) : _matern_laplacian_avgmpfa_3d(domain, prior, fields.H)
         volumes_eff = volumes
         κ_all = κ_eff
         τ_all = τ_eff
         halo_idx = Int[]
-        halo_meta = nothing
+        halo_meta = (diffusion_scheme = scheme, boundary = boundary)
         transmissibilities_ext = T
         fields_out = _matern_extend_fields_3d(fields, Int[], κ_eff, τ_eff, scalar_offset)
     else
@@ -260,17 +446,21 @@ function matern_spde_operator(domain::DataDomain, prior::MaternSPDE3Prior, θ = 
     end
 
     C = Diagonal(volumes_eff)
-    Kmat = sparse(L_H + Diagonal(volumes_eff .* κ_all.^2))
-    K = Symmetric(Kmat)
+    robin_diag = boundary == :robin ? _matern_robin_diagonal_3d(domain, κ_all; scale = robin_scale) : zeros(Float64, length(κ_all))
+    Kmat = sparse(L_H + Diagonal(volumes_eff .* κ_all.^2 .+ robin_diag))
+    K = scheme == :tpfa ? Symmetric(Kmat) : Kmat
     Dτ = Diagonal(τ_all)
     Cinv = Diagonal(1.0 ./ volumes_eff)
-    Q = Symmetric(sparse(Dτ*Kmat*Cinv*Kmat*Dτ))
+    Qmat = scheme == :tpfa ? sparse(Dτ*Kmat*Cinv*Kmat*Dτ) : sparse(Dτ*(Kmat'*Cinv*Kmat)*Dτ)
+    Q = Symmetric(Qmat)
 
     return (
         L_H = L_H,
         C = C,
         K = K,
         Q = Q,
+        diffusion_scheme = scheme,
+        boundary = boundary,
         transmissibilities = T,
         transmissibilities_ext = transmissibilities_ext,
         interior_idx = interior_idx,
@@ -352,6 +542,22 @@ function _qinv_columns_via_K(K::Symmetric, C::Diagonal, τ::AbstractVector, idx:
     return cols
 end
 
+function _matern_qinv_diagonal_3d(op, idx::AbstractVector{<:Integer})
+    if op.K isa Symmetric
+        return _qinv_diagonal_via_K(op.K, op.C, op.fields.τ, idx)
+    else
+        return _selected_qinv_diagonal(op.Q, idx)
+    end
+end
+
+function _matern_qinv_columns_3d(op, idx::AbstractVector{<:Integer})
+    if op.K isa Symmetric
+        return _qinv_columns_via_K(op.K, op.C, op.fields.τ, idx)
+    else
+        return _selected_qinv_columns(op.Q, idx)
+    end
+end
+
 function matern_realized_variance(
         domain::DataDomain,
         prior::MaternSPDE3Prior,
@@ -359,12 +565,13 @@ function matern_realized_variance(
         method::Symbol = :diag_qinv,
         anchors = :all,
         compensated::Bool = true,
-        halo = nothing
+        halo = nothing,
+        boundary::Symbol = :none
     )
     method == :diag_qinv || throw(ArgumentError("Only method = :diag_qinv is supported, got $method."))
-    op = matern_spde_operator(domain, prior, θ; compensated = compensated, halo = halo)
+    op = matern_spde_operator(domain, prior, θ; compensated = compensated, halo = halo, boundary = boundary)
     idx = _resolve_matern_anchors(prior.nc, anchors)
-    diagvals = _qinv_diagonal_via_K(op.K, op.C, op.fields.τ, idx)
+    diagvals = _matern_qinv_diagonal_3d(op, idx)
     return (anchors = idx, realized = diagvals, target = op.fields.σ[idx].^2)
 end
 
@@ -385,7 +592,8 @@ function matern_sd_compensation!(
         diag_method::Symbol = :chol,
         anchors = :all,
         fd_delta::Real = 1e-3,
-        halo = nothing
+        halo = nothing,
+        boundary::Symbol = :none
     )
     mode == :mean || throw(ArgumentError("The 3D implementation only supports mode = :mean, got $mode."))
     diag_method == :chol || throw(ArgumentError("Only diag_method = :chol is supported, got $diag_method."))
@@ -397,7 +605,15 @@ function matern_sd_compensation!(
 
     saved = prior.sd_compensation
     prior.sd_compensation = nothing
-    base = matern_realized_variance(domain, prior, θ; anchors = idx, compensated = true, halo = halo)
+    base = matern_realized_variance(
+        domain,
+        prior,
+        θ;
+        anchors = idx,
+        compensated = true,
+        halo = halo,
+        boundary = boundary
+    )
     target = matern_parameter_fields(prior, θ).σ[idx].^2
     offset = mean(0.5 .* (log.(base.realized) .- log.(target)))
     prior.sd_compensation = MaternMeanSDCompensation(:mean, idx, Float64(offset))
@@ -418,18 +634,19 @@ function matern_realized_axis_ranges(
         anchors = :all,
         corr_level::Real = _matern_practical_corr_level(prior.ν),
         compensated::Bool = true,
-        halo = nothing
+        halo = nothing,
+        boundary::Symbol = :none
     )
     0 < corr_level < 1 || throw(ArgumentError("corr_level must lie in (0, 1), got $corr_level."))
-    op = matern_spde_operator(domain, prior, θ; compensated = compensated, halo = halo)
+    op = matern_spde_operator(domain, prior, θ; compensated = compensated, halo = halo, boundary = boundary)
     idx = _resolve_matern_anchors(prior.nc, anchors)
     if prior.nc <= 256
-        vars = _qinv_diagonal_via_K(op.K, op.C, op.fields.τ, collect(1:prior.nc))
+        vars = _matern_qinv_diagonal_3d(op, collect(1:prior.nc))
     else
         vars = copy(op.fields.σ[1:prior.nc].^2)
-        vars[idx] .= _qinv_diagonal_via_K(op.K, op.C, op.fields.τ, idx)
+        vars[idx] .= _matern_qinv_diagonal_3d(op, idx)
     end
-    covcols = _qinv_columns_via_K(op.K, op.C, op.fields.τ, idx)[1:prior.nc, :]
+    covcols = _matern_qinv_columns_3d(op, idx)[1:prior.nc, :]
     pts = Matrix{Float64}(domain[:cell_centroids])
 
     rx = Vector{Float64}(undef, length(idx))
@@ -452,9 +669,9 @@ function matern_realized_axis_ranges(
         realized_x = rx,
         realized_y = ry,
         realized_z = rz,
-        target_x = op.fields.ρ[idx] .* exp.(0.5 .* op.fields.a[idx]),
-        target_y = op.fields.ρ[idx] .* exp.(0.5 .* op.fields.b[idx]),
-        target_z = op.fields.ρ[idx] .* exp.(-0.5 .* (op.fields.a[idx] .+ op.fields.b[idx]))
+        target_x = op.fields.ρ_x[idx],
+        target_y = op.fields.ρ_y[idx],
+        target_z = op.fields.ρ_z[idx]
     )
 end
 
